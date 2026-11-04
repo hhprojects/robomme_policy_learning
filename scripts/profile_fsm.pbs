@@ -1,0 +1,34 @@
+#!/bin/bash
+#PBS -N fsm-profile
+#PBS -P personal-hlee052
+#PBS -q normal
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -r n
+#PBS -o /scratch/users/ntu/hlee052/robomme_policy_learning/runs/profiling/job.log
+
+# Speed and memory profile of FrameSamp+Modul on real frames, repeated 3 times.
+# It runs the model only, so it doesn't use the simulator or its graphics.
+
+export SCRATCH=/scratch/users/ntu/$USER
+export PATH="$HOME/.local/bin:$PATH"
+export UV_CACHE_DIR=$SCRATCH/.cache/uv
+export OPENPI_DATA_HOME=$SCRATCH/openpi
+export HF_HOME=$SCRATCH/hf
+export PYTHONUNBUFFERED=1
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+REPO=$SCRATCH/robomme_policy_learning
+SAVE_DIR=runs/profiling
+
+module load git
+cd "$REPO"
+echo "node: $(hostname)  job: $PBS_JOBID  code: $(git rev-parse --short HEAD)"
+nvidia-smi -L
+
+for run in 1 2 3; do
+    uv run scripts/profile_fsm.py --out $SAVE_DIR/fsm_real_$run.json >> $SAVE_DIR/profile.log 2>&1 \
+        || { echo "profile run $run failed"; exit 1; }
+    echo "profile run $run finished"
+done

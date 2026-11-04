@@ -1,9 +1,10 @@
-"""Profile FrameSamp+Modul: per-part timing, history-frame memory, and KV cache size.
+"""Profile FrameSamp+Modul on real frames: per-part timing, history-frame memory, and KV cache size.
 
 Run from the repo root on a GPU node:
     XLA_PYTHON_CLIENT_PREALLOCATE=false uv run scripts/profile_fsm.py
 """
 import dataclasses
+import itertools
 import json
 import pathlib
 import time
@@ -27,7 +28,12 @@ class Args:
     ckpt_dir: str = "runs/ckpts/mme_vla_suite/perceptual-framesamp-modul/79999"
     config: str = "mme_vla_suite"
     history_frames: int = 64  # frames pushed into the memory buffer before profiling
-    img_size: int = 256  # fake camera resolution; the model resizes to 224 anyway
+    # real frames and the task goal from the full run
+    frames_file: str = "runs/evaluation/perceptual-framesamp-modul/ckpt79999/seed7/frames/PickXtimes_ep0.npz"
+    prompt: str = (
+        "pick up the green cube and place it on the target, repeating this action three times, "
+        "then press the button to stop"
+    )
     num_steps: int = 10  # flow-matching steps, same as sample_actions' default
     warmup: int = 3
     iters: int = 50
@@ -69,11 +75,33 @@ def jit_part(model, fn):
     return lambda *args: jitted(state, *args)
 
 
-def fake_obs(rng, size, prompt="pick up the cube"):
+def compiled_memory(model, fn, *args):
+    """GPU memory one call needs, from the compiler. Live counters can't show it: loading sets their peak."""
+    graphdef, state = nnx.split(model)
+
+    def f(state, *args):
+        return fn(nnx.merge(graphdef, state), *args)
+
+    stats = jax.jit(f).lower(state, *args).compile().memory_analysis()
     return {
-        "observation/image": rng.integers(0, 256, (size, size, 3), dtype=np.uint8),
-        "observation/wrist_image": rng.integers(0, 256, (size, size, 3), dtype=np.uint8),
-        "observation/state": rng.random(8).astype(np.float32),
+        "temp_bytes": int(stats.temp_size_in_bytes),
+        "argument_bytes": int(stats.argument_size_in_bytes),
+        "output_bytes": int(stats.output_size_in_bytes),
+    }
+
+
+def load_frames(path):
+    data = np.load(path)
+    return data["images"], data["wrist_images"], data["states"]
+
+
+def real_obs(frames, index, prompt):
+    images, wrist_images, states = frames
+    index %= len(images)
+    return {
+        "observation/image": images[index],
+        "observation/wrist_image": wrist_images[index],
+        "observation/state": states[index],
         "prompt": prompt,
     }
 
@@ -118,8 +146,14 @@ def make_part_expert_step(dt):
     return part_expert_step
 
 def main(args: Args):
-    rng = np.random.default_rng(0)
-    report = {"args": dataclasses.asdict(args), "device": str(jax.devices()[0])}
+    frames = load_frames(args.frames_file)
+    images, _, states = frames
+    report = {
+        "args": dataclasses.asdict(args),
+        "device": str(jax.devices()[0]),
+        "gpu_name": jax.devices()[0].device_kind,
+        "frames_in_file": len(images),
+    }
 
     # ---- load ----
     mem_before = gpu_mem()
@@ -134,10 +168,8 @@ def main(args: Args):
     add_times = []
     for start in range(0, args.history_frames, chunk):
         n = min(chunk, args.history_frames - start)
-        batch = {
-            "images": rng.integers(0, 256, (n, cfg.num_views, args.img_size, args.img_size, 3), dtype=np.uint8),
-            "state": rng.random((n, 8)).astype(np.float32),
-        }
+        index = np.arange(start, start + n) % len(images)
+        batch = {"images": images[index][:, None], "state": states[index]}  # same shape as pack_buffer
         t0 = time.perf_counter()
         policy.add_buffer(batch)  # ends with jax.device_get, so it is already synchronous
         add_times.append((time.perf_counter() - t0) * 1000)
@@ -153,7 +185,7 @@ def main(args: Args):
     report["history_frames_in_buffer"] = len(feats)
 
     # ---- build the exact observation infer() builds ----
-    obs_dict = fake_obs(rng, args.img_size)
+    obs_dict = real_obs(frames, args.history_frames, args.prompt)
     inputs = policy._prepare_history(jax.tree.map(lambda x: x, obs_dict))
     inputs = policy._input_transform(inputs)
     observation = HistAugObservation.from_dict(jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs))
@@ -189,7 +221,8 @@ def main(args: Args):
     sample = policy._sample_actions
     key = jax.random.key(1)
     timing["sample_actions_fused"] = bench(lambda: sample(key, observation), w, n)
-    timing["policy_infer_end_to_end"] = bench(lambda: policy.infer(fake_obs(rng, args.img_size)), w, n)
+    next_frame = itertools.count(args.history_frames)
+    timing["policy_infer_end_to_end"] = bench(lambda: policy.infer(real_obs(frames, next(next_frame), args.prompt)), w, n)
     timing["sum_of_parts"] = {
         "median_ms": sum(timing[k]["median_ms"] for k in ["vit_current_images", "memory_encoder", "llm_prefix", "expert_all_steps_est"])
     }
@@ -202,6 +235,7 @@ def main(args: Args):
     report["memory_seq_into_expert"] = describe({"mem_seq": mem_seq, "mem_mask": mem_mask})
 
     report["gpu_mem_end"] = gpu_mem()
+    report["gpu_mem_per_request"] = compiled_memory(model, lambda m, *a: m.sample_actions(*a), key, observation)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
