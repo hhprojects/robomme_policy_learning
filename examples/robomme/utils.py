@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import contextlib
 import numpy as np
 import cv2
 import imageio
@@ -44,6 +45,38 @@ SUBGOAL_TYPES = ("simple_subgoal", "grounded_subgoal")
 
 def ms_since(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 3)
+
+
+@contextlib.contextmanager
+def atomic_path(path):
+    """Yield a temporary path, then move it onto `path` once it is safely on disk.
+
+    A crash leaves the previous file or the new one, never a partial file.
+    The temporary name keeps the extension, which imageio and numpy rely on.
+    """
+    path = Path(path)
+    tmp_path = path.with_name(f".tmp_{path.name}")
+    try:
+        yield tmp_path
+        fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def write_json(path, data, **kwargs):
+    with atomic_path(path) as tmp_path:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, **kwargs)
 
 
 def pack_buffer(image_buffer, state_buffer, exec_start_idx=0):
@@ -118,19 +151,19 @@ class EpisodeRunLog:
         name = f"{self.task_name}_ep{self.episode_id}"
         log_dir = Path(save_dir) / "run_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"{name}.json", "w") as f:
-            json.dump({k: v for k, v in vars(self).items() if k != "_frames"}, f)
+        write_json(log_dir / f"{name}.json", {k: v for k, v in vars(self).items() if k != "_frames"})
 
         if self._frames["images"]:
             frames_dir = Path(save_dir) / "frames"
             frames_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                frames_dir / f"{name}.npz",
-                images=np.stack(self._frames["images"]).astype(np.uint8),
-                wrist_images=np.stack(self._frames["wrist_images"]).astype(np.uint8),
-                states=np.stack(self._frames["states"]).astype(np.float32),
-                exec_start_idx=self.exec_start_idx,
-            )
+            with atomic_path(frames_dir / f"{name}.npz") as tmp_path:
+                np.savez_compressed(
+                    tmp_path,
+                    images=np.stack(self._frames["images"]).astype(np.uint8),
+                    wrist_images=np.stack(self._frames["wrist_images"]).astype(np.uint8),
+                    states=np.stack(self._frames["states"]).astype(np.float32),
+                    exec_start_idx=self.exec_start_idx,
+                )
 
 
 class RolloutRecorder:
@@ -213,4 +246,5 @@ class RolloutRecorder:
         return text_area
              
     def save_video(self, filename: str):
-        imageio.mimsave(os.path.join(self.save_dir, filename), self.total_images, fps=self.fps)
+        with atomic_path(os.path.join(self.save_dir, filename)) as tmp_path:
+            imageio.mimsave(tmp_path, self.total_images, fps=self.fps)

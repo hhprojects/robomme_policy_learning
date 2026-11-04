@@ -18,6 +18,7 @@ from utils import (
     EpisodeState,
     EpisodeRunLog,
     ms_since,
+    write_json,
 )
 from utils import RolloutRecorder
 from env_runner import EnvRunner
@@ -316,8 +317,7 @@ def setup_log_dict(save_dir: Path, args: Args) -> dict:
                 del log_dict[task_name]
                 os.system(f"rm -f {save_dir / 'videos' / f'{task_name}_ep*.mp4'}")
 
-    with open(save_dir / "progress.json", "w") as f:
-        json.dump(log_dict, f, indent=2)
+    write_json(save_dir / "progress.json", log_dict, indent=2)
 
     return log_dict
 
@@ -378,8 +378,7 @@ def evaluate(args: Args):
                     print(f"Error saving run log for episode {episode_id} of task {task_name}: {e}")
 
                 env_runner.close_env()
-                with open(save_dir / "progress.json", "w") as f:
-                    json.dump(log_dict, f, indent=2)
+                write_json(save_dir / "progress.json", log_dict, indent=2)
 
                 if success_flag == "unknown":
                     print("API calling error, aborting...")
@@ -397,8 +396,7 @@ def evaluate(args: Args):
             final_results["total_success_rate"] = (
                 sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
             )
-            with open(save_dir / "log.json", "w") as f:
-                json.dump(final_results, f, indent=2)
+            write_json(save_dir / "log.json", final_results, indent=2)
         except Exception as e:
             print(f"Error saving final results: {e}")
             time.sleep(1)
