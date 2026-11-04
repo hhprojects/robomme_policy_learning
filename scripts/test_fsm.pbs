@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N fsm-test
+#PBS -P personal-hlee052
+#PBS -q normal
+#PBS -l select=1:ngpus=2
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o /scratch/users/ntu/hlee052/robomme_policy_learning/runs/test_run/job.log
+
+# Short real run of FrameSamp+Modul on one task, stopped after 40 minutes.
+# It saves to runs/test_run, so it never touches the full run's results.
+
+export SCRATCH=/scratch/users/ntu/$USER
+export PATH="$HOME/.local/bin:$PATH"
+export UV_CACHE_DIR=$SCRATCH/.cache/uv
+export MAMBA_ROOT_PREFIX=$SCRATCH/micromamba
+export OPENPI_DATA_HOME=$SCRATCH/openpi
+export HF_HOME=$SCRATCH/hf
+export PYTHONUNBUFFERED=1
+
+REPO=$SCRATCH/robomme_policy_learning
+SAVE_DIR=runs/test_run
+CKPT=runs/ckpts/mme_vla_suite/perceptual-framesamp-modul/79999
+PORT=$((20000 + RANDOM % 10000))
+
+module load git
+cd "$REPO"
+echo "node: $(hostname)  job: $PBS_JOBID  code: $(git rev-parse --short HEAD)  port: $PORT"
+nvidia-smi -L
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py --seed=7 --port=$PORT policy:checkpoint \
+    --policy.dir=$CKPT --policy.config=mme_vla_suite > $SAVE_DIR/serve.log 2>&1 &
+SERVER_PID=$!
+
+until grep -q 'Creating server' $SAVE_DIR/serve.log; do
+    kill -0 $SERVER_PID 2>/dev/null || { echo "ERROR: policy server stopped"; exit 1; }
+    sleep 10
+done
+echo "policy server ready"
+
+eval "$(micromamba shell hook -s bash)" && micromamba activate robomme
+
+CUDA_VISIBLE_DEVICES=1 VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json timeout 40m \
+    python -u examples/robomme/eval.py \
+    --args.host=127.0.0.1 --args.port=$PORT --args.model_seed=7 \
+    --args.policy_name=perceptual-framesamp-modul --args.model_ckpt_id=79999 \
+    --args.only_tasks=PickXtimes --args.save_dir=$SAVE_DIR > $SAVE_DIR/eval.log 2>&1
+echo "eval exit code: $? (124 means stopped at the 40 minute limit)"
+
+kill $SERVER_PID
