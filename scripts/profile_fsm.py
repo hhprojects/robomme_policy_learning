@@ -21,6 +21,7 @@ from mme_vla_suite.models.integration.history_observation import preprocess_obse
 from mme_vla_suite.models.integration.history_pi0 import make_attn_mask
 from mme_vla_suite.policies import policy_config as _policy_config
 from mme_vla_suite.training import config as _config
+from openpi.shared import array_typing as at
 
 
 @dataclasses.dataclass
@@ -82,7 +83,9 @@ def compiled_memory(model, fn, *args):
     def f(state, *args):
         return fn(nnx.merge(graphdef, state), *args)
 
-    stats = jax.jit(f).lower(state, *args).compile().memory_analysis()
+    # lower() traces with placeholder values, which the observation's type checks reject
+    with at.disable_typechecking():
+        stats = jax.jit(f).lower(state, *args).compile().memory_analysis()
     return {
         "temp_bytes": int(stats.temp_size_in_bytes),
         "argument_bytes": int(stats.argument_size_in_bytes),
