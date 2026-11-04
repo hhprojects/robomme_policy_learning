@@ -88,11 +88,13 @@ class MME_VLA_Policy:
         self._rng, sample_rng = jax.random.split(self._rng)
     
         start_time = time.monotonic()
+        actions = self._sample_actions(sample_rng, observation, **self._sample_kwargs)
+        jax.block_until_ready(actions)  # jax returns before the GPU finishes, so wait or the timer reads too low
+        model_time = time.monotonic() - start_time
         outputs = {
             "state": observation.state,
-            "actions": self._sample_actions(sample_rng, observation, **self._sample_kwargs),
+            "actions": actions,
         }
-        model_time = time.monotonic() - start_time
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)      
         outputs = self._output_transform(outputs)
         outputs["infer_time_ms"] = model_time * 1000

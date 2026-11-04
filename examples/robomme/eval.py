@@ -16,6 +16,8 @@ from utils import (
     TASK_WITH_VIDEO_DEMO,
     SUBGOAL_TYPES,
     EpisodeState,
+    EpisodeRunLog,
+    ms_since,
 )
 from utils import RolloutRecorder
 from env_runner import EnvRunner
@@ -37,6 +39,8 @@ class Args:
     max_steps: int = 1300
     save_dir: str = "runs/evaluation"
     overwrite: bool = False
+
+    save_frames_per_task: int = 3 # keep raw frames for the first N episodes of each task
 
     use_history: bool = True
     policy_name: str = "dummy_test"
@@ -68,6 +72,7 @@ class EpisodeEvaluator:
     def __init__(self, args: Args, save_dir: Path):
         self.args = args
         self.save_dir = save_dir
+        self.run_log = None
 
     def eval_each_episode(
         self,
@@ -75,12 +80,20 @@ class EpisodeEvaluator:
         subgoal_predictor: SubgoalPredictorBase,
         video_save_dir: Path,
     ) -> str:
+        self.run_log = EpisodeRunLog(
+            env_runner.env_id,
+            env_runner.episode_id,
+            save_frames=env_runner.episode_id < self.args.save_frames_per_task,
+        )
+        self.run_log.difficulty = env_runner.difficulty
+
         client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(
             self.args.host, self.args.port
         )
         resp = client.reset()
         while not resp.get("reset_finished", False):
             time.sleep(0.1)
+        self.run_log.reset_server_ms = resp.get("reset_time_ms")
 
         epstate = EpisodeState()
         task_goal, recorder = self.init_episode(env_runner, epstate, video_save_dir)
@@ -91,6 +104,7 @@ class EpisodeEvaluator:
         success_flag = "unknown"
         subgoal = None
         last_subgoal = None
+        loop_start = time.perf_counter()
 
         while True:
             subgoal_predictor.step(epstate)
@@ -120,7 +134,9 @@ class EpisodeEvaluator:
                 last_subgoal = subgoal
 
             action = epstate.action_plan.popleft()
+            step_start = time.perf_counter()
             obs, stop_flag, success_flag = env_runner.step(action)
+            self.run_log.env_step_ms.append(ms_since(step_start))
             epstate.count += 1
 
             if epstate.count > self.args.max_steps:
@@ -130,6 +146,7 @@ class EpisodeEvaluator:
             img, wrist_img, robot_state = obs
 
             epstate.add_observation(img, wrist_img, robot_state)
+            self.run_log.add_frame(img, wrist_img, robot_state)
             recorder.record(
                 image=img.copy(),
                 wrist_image=wrist_img.copy(),
@@ -140,6 +157,9 @@ class EpisodeEvaluator:
 
             if stop_flag:
                 break
+
+        self.run_log.loop_ms = ms_since(loop_start)
+        self.run_log.outcome = success_flag
 
         if success_flag == "unknown":
             return "unknown"
@@ -157,7 +177,9 @@ class EpisodeEvaluator:
         epstate: EpisodeState,
         video_save_dir: Path,
     ) -> Tuple[str, RolloutRecorder]:
+        reset_start = time.perf_counter()
         pre_traj = env_runner.get_init_obs()
+        self.run_log.env_reset_ms = ms_since(reset_start)
         task_goal = pre_traj["task_goal"]
 
         recorder = RolloutRecorder(video_save_dir, task_goal, fps=30)
@@ -169,6 +191,7 @@ class EpisodeEvaluator:
         epstate.state_buffer.extend(pre_traj["states"])
 
         for i in range(len(pre_traj["images"])):
+            self.run_log.add_frame(pre_traj["images"][i], pre_traj["wrist_images"][i], pre_traj["states"][i])
             recorder.record(
                 image=pre_traj["images"][i].copy(),
                 wrist_image=pre_traj["wrist_images"][i].copy(),
@@ -178,6 +201,7 @@ class EpisodeEvaluator:
             )
 
         epstate.exec_start_idx = len(epstate.image_buffer) - 1
+        self.run_log.exec_start_idx = epstate.exec_start_idx
         print(f"exec_start_idx: {epstate.exec_start_idx}")
         return task_goal, recorder
 
@@ -192,14 +216,25 @@ class EpisodeEvaluator:
         subgoal: Optional[str],
         exec_horizon: int,
     ) -> list:
+        request_log = {"step": state.count}
+
         if self.args.use_history:
-            resp = client.add_buffer(pack_buffer(
+            buffer = pack_buffer(
                 state.image_buffer,
                 state.state_buffer,
                 state.exec_start_idx,
-            ))
+            )
+            add_start = time.perf_counter()
+            resp = client.add_buffer(buffer)
             while not resp.get("add_buffer_finished", False):
                 time.sleep(0.1)
+            self.run_log.buffer_frames += len(state.image_buffer)
+            request_log.update(
+                add_buffer_round_trip_ms=ms_since(add_start),
+                add_buffer_server_ms=resp.get("add_buffer_time_ms"),
+                add_buffer_frames=len(state.image_buffer),
+                buffer_frames=self.run_log.buffer_frames,
+            )
 
         element = {
             "observation/image": img,
@@ -212,7 +247,15 @@ class EpisodeEvaluator:
             element['simple_subgoal'] = subgoal
             element['grounded_subgoal'] = subgoal
 
-        action_chunk = client.infer(element)["actions"]
+        infer_start = time.perf_counter()
+        resp = client.infer(element)
+        request_log.update(
+            infer_round_trip_ms=ms_since(infer_start),
+            infer_server_ms=resp.get("infer_time_ms"),
+        )
+        self.run_log.requests.append(request_log)
+
+        action_chunk = resp["actions"]
         return action_chunk[:exec_horizon]
 
 
@@ -328,6 +371,11 @@ def evaluate(args: Args):
                 except Exception as e:
                     print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
                     log_dict[task_name][episode_id] = "error"
+
+                try:
+                    evaluator.run_log.save(save_dir)
+                except Exception as e:
+                    print(f"Error saving run log for episode {episode_id} of task {task_name}: {e}")
 
                 env_runner.close_env()
                 with open(save_dir / "progress.json", "w") as f:

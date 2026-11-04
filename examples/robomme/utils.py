@@ -1,9 +1,12 @@
 import os
+import json
+import time
 import numpy as np
 import cv2
 import imageio
 import re
 import collections
+from pathlib import Path
 from typing import Tuple, Optional
 
 
@@ -37,6 +40,10 @@ TASK_NAME_LIST=  [
 
 SUBGOAL_TYPES = ("simple_subgoal", "grounded_subgoal")
 
+
+
+def ms_since(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 3)
 
 
 def pack_buffer(image_buffer, state_buffer, exec_start_idx=0):
@@ -81,6 +88,49 @@ class EpisodeState:
 
 
 
+
+
+class EpisodeRunLog:
+    """What one real episode cost: timings, memory growth and, optionally, its raw frames."""
+
+    def __init__(self, task_name: str, episode_id: int, save_frames: bool = False):
+        self.task_name = task_name
+        self.episode_id = episode_id
+        self.outcome = "error"  # replaced at the end of a finished episode
+        self.difficulty = None
+        self.exec_start_idx = 0
+        self.save_frames = save_frames
+        self.reset_server_ms = None  # policy.reset() on the server
+        self.env_reset_ms = None     # env reset, including any demo video
+        self.loop_ms = None          # whole control loop, simulator + policy + video recording
+        self.buffer_frames = 0       # frames the server has stored so far
+        self.requests = []           # one entry per action chunk
+        self.env_step_ms = []        # one entry per simulator step
+        self._frames = {"images": [], "wrist_images": [], "states": []}
+
+    def add_frame(self, img: np.ndarray, wrist_img: np.ndarray, state: np.ndarray):
+        if self.save_frames:
+            self._frames["images"].append(img.copy())
+            self._frames["wrist_images"].append(wrist_img.copy())
+            self._frames["states"].append(state.copy())
+
+    def save(self, save_dir: Path):
+        name = f"{self.task_name}_ep{self.episode_id}"
+        log_dir = Path(save_dir) / "run_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / f"{name}.json", "w") as f:
+            json.dump({k: v for k, v in vars(self).items() if k != "_frames"}, f)
+
+        if self._frames["images"]:
+            frames_dir = Path(save_dir) / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                frames_dir / f"{name}.npz",
+                images=np.stack(self._frames["images"]).astype(np.uint8),
+                wrist_images=np.stack(self._frames["wrist_images"]).astype(np.uint8),
+                states=np.stack(self._frames["states"]).astype(np.float32),
+                exec_start_idx=self.exec_start_idx,
+            )
 
 
 class RolloutRecorder:
