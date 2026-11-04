@@ -4,6 +4,7 @@ RoboMME environment runing wrapper: build envs, get observations, and step with 
 from __future__ import annotations
 from typing import Any
 import numpy as np
+import sapien
 
 from robomme.robomme_env import *  # noqa: F401, F403 - env registration
 from robomme.env_record_wrapper import BenchmarkEnvBuilder
@@ -11,6 +12,10 @@ from robomme.env_record_wrapper import BenchmarkEnvBuilder
 from utils import TASK_NAME_LIST
 
 np.set_printoptions(precision=4, suppress=True)
+
+# SAPIEN shuts its GPU graphics down when the last simulator closes, then starts them
+# again for the next one. Holding one render system keeps them running between episodes.
+_render_keepalive = None
 
 
 def pack_state(joint_state: np.ndarray, gripper_state: np.ndarray) -> np.ndarray:
@@ -26,6 +31,10 @@ class EnvRunner:
     def __init__(self, env_id: str, video_save_dir: str, max_steps: int = 1300) -> None:
         if env_id not in TASK_NAME_LIST:
             raise ValueError(f"Environment ID {env_id} not in {TASK_NAME_LIST}")
+        global _render_keepalive
+        if _render_keepalive is None:
+            _render_keepalive = sapien.render.RenderSystem(sapien.Device("cuda"))
+
         self.env_id = env_id
         self.video_save_dir = video_save_dir
 
