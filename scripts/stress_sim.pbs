@@ -1,0 +1,33 @@
+#!/bin/bash
+#PBS -N stress-sim
+#PBS -P personal-hlee052
+#PBS -q normal
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -r n
+#PBS -o /scratch/users/ntu/hlee052/robomme_policy_learning/runs/stress_sim/job.log
+
+# Node failure test: simulator only, no model and no saving. See stress_sim.py.
+# Check with NSCC before submitting, because it may bring a shared node down.
+
+export SCRATCH=/scratch/users/ntu/$USER
+export PATH="$HOME/.local/bin:$PATH"
+export MAMBA_ROOT_PREFIX=$SCRATCH/micromamba
+export HF_HOME=$SCRATCH/hf
+export PYTHONUNBUFFERED=1
+
+REPO=$SCRATCH/robomme_policy_learning
+SAVE_DIR=runs/stress_sim
+
+module load git
+cd "$REPO"
+mkdir -p $SAVE_DIR
+echo "node: $(hostname)  job: $PBS_JOBID  code: $(git rev-parse --short HEAD)"
+nvidia-smi -L
+
+eval "$(micromamba shell hook -s bash)" && micromamba activate robomme
+
+VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json \
+    python -u examples/robomme/stress_sim.py >> $SAVE_DIR/stress.log 2>&1
+echo "stress exit code: $?"

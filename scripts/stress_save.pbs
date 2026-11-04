@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -N stress-save
+#PBS -P personal-hlee052
+#PBS -q normal
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -r n
+#PBS -o /scratch/users/ntu/hlee052/robomme_policy_learning/runs/stress_save/job.log
+
+# Node failure test: saving only, no simulator or model. See stress_save.py.
+# It leaves the GPU idle, but asks for one so it lands on the same kind of node.
+# Check with NSCC before submitting, because it may bring a shared node down.
+
+export SCRATCH=/scratch/users/ntu/$USER
+export PATH="$HOME/.local/bin:$PATH"
+export MAMBA_ROOT_PREFIX=$SCRATCH/micromamba
+export PYTHONUNBUFFERED=1
+
+REPO=$SCRATCH/robomme_policy_learning
+SAVE_DIR=runs/stress_save
+
+module load git
+cd "$REPO"
+mkdir -p $SAVE_DIR
+echo "node: $(hostname)  job: $PBS_JOBID  code: $(git rev-parse --short HEAD)"
+
+eval "$(micromamba shell hook -s bash)" && micromamba activate robomme
+
+python -u examples/robomme/stress_save.py >> $SAVE_DIR/stress.log 2>&1
+echo "stress exit code: $?"
